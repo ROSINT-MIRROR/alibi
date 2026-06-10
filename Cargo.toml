@@ -1,0 +1,9 @@
+[package]
+name = "alibi"
+version = "0.1.0"
+edition = "2024"
+description = "Third-party witness archiver: get a URL independent, publicly verifiable alibis"
+
+[dependencies]
+ureq = "2"
+serde_json = "1"
