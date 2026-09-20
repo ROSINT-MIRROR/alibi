@@ -25,12 +25,7 @@ const SILENT_ERROR_PATTERNS: &[&str] = &[
     "while let Ok(",
 ];
 
-const RESULT_OPTION_MATCH_ARMS: &[&str] = &[
-    "None =>",
-    "Some(_) =>",
-    "Ok(_) =>",
-    "Err(_) =>",
-];
+const RESULT_OPTION_MATCH_ARMS: &[&str] = &["None =>", "Some(_) =>", "Ok(_) =>", "Err(_) =>"];
 
 const ERR_DEFAULT_VALUES: &[&str] = &[
     "=> None",
@@ -81,17 +76,27 @@ fn category_for(rule: &str) -> &'static str {
 fn category_spirit(cat: &str) -> &'static str {
     match cat {
         "DECOMPOSITION" => "every file has one job. if it outgrew that job, split it.",
-        "ERROR" => "propagate or crash. there is no third option. if an operation failed, the caller must know.",
-        "TYPE" => "the type signature is the contract. if the error type is erased, the contract is worthless.",
-        "DEAD" => "code that isn't serving the program right now is noise. noise misleads. delete it.",
+        "ERROR" => {
+            "propagate or crash. there is no third option. if an operation failed, the caller must know."
+        }
+        "TYPE" => {
+            "the type signature is the contract. if the error type is erased, the contract is worthless."
+        }
+        "DEAD" => {
+            "code that isn't serving the program right now is noise. noise misleads. delete it."
+        }
         _ => "",
     }
 }
 
 fn rule_help(rule: &str) -> &'static str {
     match rule {
-        "DECOMPOSITION:1" => "split by responsibility, not by arbitrary cut. if a file does two things, make two files.",
-        "DECOMPOSITION:2" => "lib.rs and mod.rs are wiring — mod, use, attributes. move logic to its own file.",
+        "DECOMPOSITION:1" => {
+            "split by responsibility, not by arbitrary cut. if a file does two things, make two files."
+        }
+        "DECOMPOSITION:2" => {
+            "lib.rs and mod.rs are wiring — mod, use, attributes. move logic to its own file."
+        }
         "ERROR:3" => concat!(
             ".unwrap(), .expect(), .ok(), .or(), if let Some/Ok, let _ =, _ => are all banned.\n",
             "    the ONLY legal moves: propagate with ? or return Err() explicitly.\n",
@@ -174,11 +179,7 @@ fn format_report(hits: &[Hit]) -> String {
             None => continue,
         };
 
-        out.push_str(&format!(
-            "\n--- {} --- {}\n",
-            cat,
-            category_spirit(cat)
-        ));
+        out.push_str(&format!("\n--- {} --- {}\n", cat, category_spirit(cat)));
 
         for rule in rules {
             let locations = match by_rule.get(rule) {
@@ -232,7 +233,7 @@ fn scan_dir(manifest_dir: &Path, dir: &Path, hits: &mut Vec<Hit>) {
         let path = entry.path();
         if path.is_dir() {
             scan_dir(manifest_dir, &path, hits);
-        } else if path.extension().map_or(false, |e| e == "rs") {
+        } else if path.extension().is_some_and(|e| e == "rs") {
             scan_file(manifest_dir, &path, hits);
         }
     }
@@ -292,10 +293,7 @@ fn scan_file(manifest_dir: &Path, path: &Path, hits: &mut Vec<Hit>) {
             }
             continue;
         }
-        if !in_block_comment
-            && !trimmed.starts_with("//")
-            && trimmed.starts_with("macro_rules!")
-        {
+        if !in_block_comment && !trimmed.starts_with("//") && trimmed.starts_with("macro_rules!") {
             in_macro_rules = true;
             macro_brace_depth = trimmed.chars().filter(|&c| c == '{').count() as i32;
             macro_brace_depth -= trimmed.chars().filter(|&c| c == '}').count() as i32;
@@ -680,13 +678,30 @@ fn is_erased_err_type(err_ty: &str) -> bool {
     }
 
     const BANNED_EXACT: &[&str] = &[
-        "String", "&str", "&'static str", "str",
-        "anyhow::Error", "eyre::Report",
-        "i8", "i16", "i32", "i64", "i128", "isize",
-        "u8", "u16", "u32", "u64", "u128", "usize",
-        "f32", "f64", "bool", "char",
+        "String",
+        "&str",
+        "&'static str",
+        "str",
+        "anyhow::Error",
+        "eyre::Report",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "i128",
+        "isize",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "u128",
+        "usize",
+        "f32",
+        "f64",
+        "bool",
+        "char",
     ];
-    if BANNED_EXACT.iter().any(|b| *b == normalized) {
+    if BANNED_EXACT.contains(&normalized) {
         return true;
     }
 

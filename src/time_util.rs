@@ -1,146 +1,147 @@
-//! UTC math without a chrono dep: wayback ts14 strings ("20260610050921")
-//! and RFC1123 memento datetimes ("Wed, 10 Jun 2026 05:09:21 GMT").
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn epoch_now() -> u64 {
-    SystemTime::now()
+use crate::error::Error;
+
+pub fn epoch_now() -> Result<u64, Error> {
+    let since = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_err(|e| Error::Clock(e.to_string()))?;
+    Ok(since.as_secs())
 }
 
-// Hinnant civil-date algorithms; exact for all Gregorian dates.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 {
+        year / 400
+    } else {
+        (year - 399) / 400
+    };
+    let year_of_era = year - era * 400;
+    let shifted_month = (month + 9) % 12;
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146097 + day_of_era - 719468
 }
 
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-pub fn epoch_to_ts14(epoch: u64) -> String {
-    let (y, m, d) = civil_from_days((epoch / 86400) as i64);
-    let rem = epoch % 86400;
-    format!(
-        "{y:04}{m:02}{d:02}{:02}{:02}{:02}",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
-}
-
-/// Wayback emits 4–14 digits; missing parts default to the period start.
-pub fn ts14_to_epoch(ts: &str) -> Option<u64> {
+pub fn ts14_to_epoch(ts: &str) -> Result<u64, Error> {
     if ts.len() < 4 || !ts.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+        return Err(Error::Parse(format!("not a ts14: {ts:?}")));
     }
-    let part = |r: std::ops::Range<usize>, def: i64| -> Option<i64> {
-        if ts.len() >= r.end { ts[r].parse().ok() } else { Some(def) }
-    };
-    let y = part(0..4, 0)?;
-    let m = part(4..6, 1)?;
-    let d = part(6..8, 1)?;
-    let h = part(8..10, 0)?;
-    let mi = part(10..12, 0)?;
-    let s = part(12..14, 0)?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
-        return None;
+    let year = digits(ts, 0..4, 0)?;
+    let month = digits(ts, 4..6, 1)?;
+    let day = digits(ts, 6..8, 1)?;
+    let hour = digits(ts, 8..10, 0)?;
+    let minute = digits(ts, 10..12, 0)?;
+    let second = digits(ts, 12..14, 0)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(Error::Parse(format!("ts14 out of range: {ts:?}")));
     }
-    let secs = days_from_civil(y, m, d) * 86400 + h * 3600 + mi * 60 + s;
-    u64::try_from(secs).ok()
+    if hour > 23 || minute > 59 || second > 60 {
+        return Err(Error::Parse(format!("ts14 out of range: {ts:?}")));
+    }
+    let secs = days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
+    u64::try_from(secs).map_err(|e| Error::Parse(e.to_string()))
 }
 
-pub fn rfc1123_to_epoch(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let s = s.split_once(',').map(|(_, r)| r.trim()).unwrap_or(s);
-    let mut it = s.split_whitespace();
-    let d: i64 = it.next()?.parse().ok()?;
-    let m = match it.next()? {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let y: i64 = it.next()?.parse().ok()?;
-    let mut hms = it.next()?.split(':');
-    let h: i64 = hms.next()?.parse().ok()?;
-    let mi: i64 = hms.next()?.parse().ok()?;
-    let sec: i64 = hms.next()?.parse().ok()?;
-    let secs = days_from_civil(y, m, d) * 86400 + h * 3600 + mi * 60 + sec;
-    u64::try_from(secs).ok()
+fn digits(ts: &str, range: std::ops::Range<usize>, absent: i64) -> Result<i64, Error> {
+    if ts.len() < range.end {
+        return Ok(absent);
+    }
+    ts[range]
+        .parse::<i64>()
+        .map_err(|e| Error::Parse(e.to_string()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719468;
+    let era = if shifted >= 0 {
+        shifted / 146097
+    } else {
+        (shifted - 146096) / 146097
+    };
+    let day_of_era = shifted - era * 146097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
+}
 
-    #[test]
-    fn ts14_epoch_zero() {
-        assert_eq!(epoch_to_ts14(0), "19700101000000");
-        assert_eq!(ts14_to_epoch("19700101000000"), Some(0));
+pub fn epoch_to_ts14(epoch: u64) -> Result<String, Error> {
+    let secs = i64::try_from(epoch).map_err(|e| Error::Parse(e.to_string()))?;
+    let days = secs.div_euclid(86400);
+    let rest = secs.rem_euclid(86400);
+    let (year, month, day) = civil_from_days(days);
+    if !(0..=9999).contains(&year) {
+        return Err(Error::Parse(format!("epoch out of ts14 range: {epoch}")));
     }
+    let hour = rest / 3600;
+    let minute = (rest % 3600) / 60;
+    let second = rest % 60;
+    Ok(format!(
+        "{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}"
+    ))
+}
 
-    #[test]
-    fn ts14_known_date() {
-        // 2026-06-10 00:00:00 UTC
-        assert_eq!(epoch_to_ts14(1_781_049_600), "20260610000000");
-        assert_eq!(ts14_to_epoch("20260610000000"), Some(1_781_049_600));
-    }
+pub fn rfc1123_to_epoch(stamp: &str) -> Result<u64, Error> {
+    let body = after_weekday(stamp.trim());
+    let mut fields = body.split_whitespace();
+    let day: i64 = next_num(&mut fields, "day")?;
+    let month = month_num(next_field(&mut fields, "month")?)?;
+    let year: i64 = next_num(&mut fields, "year")?;
+    let clock = next_field(&mut fields, "time")?;
+    let mut hms = clock.split(':');
+    let hour: i64 = next_num(&mut hms, "hour")?;
+    let minute: i64 = next_num(&mut hms, "minute")?;
+    let second: i64 = next_num(&mut hms, "second")?;
+    let secs = days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
+    u64::try_from(secs).map_err(|e| Error::Parse(e.to_string()))
+}
 
-    #[test]
-    fn ts14_round_trip() {
-        for e in [0u64, 1_000_000_000, 1_779_824_055, 1_781_068_161] {
-            assert_eq!(ts14_to_epoch(&epoch_to_ts14(e)), Some(e));
-        }
-    }
+fn after_weekday(stamp: &str) -> &str {
+    let Some((_weekday, rest)) = stamp.split_once(',') else {
+        return stamp;
+    };
+    rest.trim()
+}
 
-    #[test]
-    fn ts14_partial() {
-        assert_eq!(ts14_to_epoch("2026"), ts14_to_epoch("20260101000000"));
-        assert_eq!(ts14_to_epoch("20260526"), ts14_to_epoch("20260526000000"));
-    }
+fn next_field<'a>(
+    fields: &mut impl Iterator<Item = &'a str>,
+    what: &str,
+) -> Result<&'a str, Error> {
+    fields
+        .next()
+        .ok_or(Error::Parse(format!("rfc1123: missing {what}")))
+}
 
-    #[test]
-    fn ts14_garbage() {
-        assert_eq!(ts14_to_epoch(""), None);
-        assert_eq!(ts14_to_epoch("not-a-ts"), None);
-        assert_eq!(ts14_to_epoch("20269999"), None);
-    }
+fn next_num<'a>(fields: &mut impl Iterator<Item = &'a str>, what: &str) -> Result<i64, Error> {
+    next_field(fields, what)?
+        .parse::<i64>()
+        .map_err(|e| Error::Parse(format!("rfc1123 {what}: {e}")))
+}
 
-    #[test]
-    fn rfc1123_known() {
-        assert_eq!(rfc1123_to_epoch("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
-        assert_eq!(
-            rfc1123_to_epoch("Wed, 10 Jun 2026 00:00:00 GMT"),
-            Some(1_781_049_600)
-        );
-        // weekday-less variant some servers emit
-        assert_eq!(rfc1123_to_epoch("10 Jun 2026 00:00:00 GMT"), Some(1_781_049_600));
-        assert_eq!(rfc1123_to_epoch("garbage"), None);
+fn month_num(token: &str) -> Result<i64, Error> {
+    match token {
+        "Jan" => Ok(1),
+        "Feb" => Ok(2),
+        "Mar" => Ok(3),
+        "Apr" => Ok(4),
+        "May" => Ok(5),
+        "Jun" => Ok(6),
+        "Jul" => Ok(7),
+        "Aug" => Ok(8),
+        "Sep" => Ok(9),
+        "Oct" => Ok(10),
+        "Nov" => Ok(11),
+        "Dec" => Ok(12),
+        other => Err(Error::Parse(format!("rfc1123: bad month {other:?}"))),
     }
 }

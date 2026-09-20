@@ -2,8 +2,32 @@
 name = "alibi"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 description = "Third-party witness archiver: get a URL independent, publicly verifiable alibis"
+license = "0BSD"
+readme = "README.md"
+keywords = ["archive", "journalism", "wayback", "osint", "preservation"]
+categories = ["command-line-utilities"]
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "tests/**/*.rs",
+    "README.md",
+    "LICENSE",
+]
 
 [dependencies]
 ureq = "2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tracing = "0.1.44"
+
+[dev-dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "alibi"
+path = "src/main.rs"
+
+[profile.release]
+strip = true

@@ -1,197 +1,123 @@
-use std::io::Write;
-use std::time::Duration;
+#![forbid(unsafe_code)]
+#![deny(unused_must_use)]
+#![deny(for_loops_over_fallibles)]
+#![deny(dead_code)]
+#![deny(unused_variables)]
+#![deny(unused_assignments)]
 
-use alibi::{Status, Testimony};
+use std::io::{self, Write};
+use std::process::ExitCode;
 
-const HELP: &str = "\
-alibi — third-party witness archiver (sherlockit)
+use alibi::args::{Mode, Options, Parsed};
+use alibi::config::{EXIT_ALL, EXIT_INTERNAL, EXIT_NONE, EXIT_SOME, EXIT_USAGE, HELP, KEY_ENV};
+use alibi::mcp;
+use alibi::render::{Line, note_of, write_line};
+use alibi::witness::credential::{Credential, parse};
+use alibi::{Error, Status, Testimony};
 
-usage:
-  alibi [options] <url>            submit to all witnesses, poll until confirmed
-  alibi --check [options] <url>    read-only: list existing snapshots
-  alibi --no-wait [options] <url>  fire submits and exit; reconcile with --check
-
-options:
-  --witness LIST   comma list of: wayback, archivetoday, ghostarchive (default: all)
-  --timeout SECS   establish deadline (default: 300)
-  --json           JSONL output instead of tab-separated lines
-  -h, --help       this
-  -V, --version    version
-
-output: one line per witness on stdout: <witness>\\t<snapshot-url|pending|none|error>
-        progress and warnings go to stderr; stdout stays pipe-clean
-exit:   0 all witnesses confirmed · 1 some · 2 none · 64 usage error
-env:    ARCHIVE_ORG_KEY=accesskey:secret enables the wayback witness
-        (free: https://archive.org/account/s3.php); no key = wayback skipped
-";
-
-enum Mode {
-    Establish,
-    Check,
-    Submit,
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(failure) => {
+            tracing::error!(error = %failure, "alibi failed");
+            eprintln!("alibi: {failure}");
+            ExitCode::from(EXIT_INTERNAL)
+        }
+    }
 }
 
-fn main() {
-    std::process::exit(run());
+fn run() -> Result<ExitCode, Error> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let options = match alibi::args::parse(&argv)? {
+        Parsed::Run(options) => options,
+        Parsed::Help => {
+            print!("{HELP}");
+            return Ok(ExitCode::from(EXIT_ALL));
+        }
+        Parsed::Version => {
+            println!("alibi {}", env!("CARGO_PKG_VERSION"));
+            return Ok(ExitCode::from(EXIT_ALL));
+        }
+        Parsed::Usage(message) => {
+            eprintln!("alibi: {message}\n\n{HELP}");
+            return Ok(ExitCode::from(EXIT_USAGE));
+        }
+    };
+    let key = read_key()?;
+    if let Mode::Mcp = options.mode {
+        let stdin = io::stdin().lock();
+        let mut stdout = io::stdout().lock();
+        mcp::serve(stdin, &mut stdout, &key)?;
+        return Ok(ExitCode::from(EXIT_ALL));
+    }
+    dispatch(&options, &key)
 }
 
-fn run() -> i32 {
-    let mut check = false;
-    let mut no_wait = false;
-    let mut json = false;
-    let mut witness_spec: Option<String> = None;
-    let mut timeout_secs: u64 = 300;
-    let mut url: Option<String> = None;
-
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--check" => check = true,
-            "--no-wait" => no_wait = true,
-            "--json" => json = true,
-            "--witness" => match args.next() {
-                Some(v) => witness_spec = Some(v),
-                None => return usage("--witness needs a value"),
-            },
-            s if s.starts_with("--witness=") => {
-                witness_spec = Some(s["--witness=".len()..].to_string());
-            }
-            "--timeout" => match args.next().and_then(|v| v.parse().ok()) {
-                Some(v) => timeout_secs = v,
-                None => return usage("--timeout needs seconds"),
-            },
-            s if s.starts_with("--timeout=") => match s["--timeout=".len()..].parse() {
-                Ok(v) => timeout_secs = v,
-                Err(_) => return usage("--timeout needs seconds"),
-            },
-            "-h" | "--help" => {
-                print!("{HELP}");
-                return 0;
-            }
-            "-V" | "--version" => {
-                println!("alibi {}", env!("CARGO_PKG_VERSION"));
-                return 0;
-            }
-            s if s.starts_with('-') => return usage(&format!("unknown flag: {s}")),
-            _ => {
-                if url.is_some() {
-                    return usage("exactly one <url> expected");
-                }
-                url = Some(a);
-            }
+fn read_key() -> Result<Credential, Error> {
+    match std::env::var(KEY_ENV) {
+        Ok(raw) => parse(&raw),
+        Err(unset) => {
+            tracing::warn!(error = %unset, "ARCHIVE_ORG_KEY unset, wayback will skip");
+            Ok(Credential::Absent)
         }
     }
+}
 
-    if check && no_wait {
-        return usage("--check and --no-wait are mutually exclusive");
-    }
-    let Some(url) = url else {
-        return usage("missing <url>");
-    };
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return usage("url must start with http:// or https://");
-    }
-
-    let witnesses = match witness_spec {
-        Some(spec) => match alibi::select(&spec) {
-            Ok(w) => w,
-            Err(e) => return usage(&e),
-        },
-        None => alibi::all(),
-    };
-
-    let mode = if check {
-        Mode::Check
-    } else if no_wait {
-        Mode::Submit
-    } else {
-        Mode::Establish
-    };
-
-    let mut out = std::io::stdout().lock();
-    let mut emit = |t: &Testimony| {
-        match t.status {
-            Status::Submitted => {
-                eprintln!("alibi: {}: {}", t.witness, t.note.as_deref().unwrap_or("submitted"));
-            }
-            Status::Skipped => {
-                eprintln!("alibi: {}: skipped — {}", t.witness, t.note.as_deref().unwrap_or("?"));
-            }
-            Status::Confirmed | Status::Pending | Status::Absent | Status::Error => {
-                match t.status {
-                    // confirmed note is the fresh-skip message; print as-is
-                    Status::Confirmed => {
-                        if let Some(n) = t.note.as_deref() {
-                            eprintln!("alibi: {}: {n}", t.witness);
-                        }
-                    }
-                    // pending/error: surface WHY with the machine code in [brackets]
-                    Status::Pending | Status::Error => {
-                        let detail = t.note.as_deref().unwrap_or("not yet public");
-                        eprintln!("alibi: {}: {detail} [{}]", t.witness, t.reason());
-                    }
-                    _ => {}
-                }
-                let line = if json {
-                    serde_json::json!({
-                        "witness": t.witness,
-                        "url": t.url,
-                        "status": t.status.as_str(),
-                        "reason": t.reason(),
-                        "snapshot": t.snapshot.as_ref().map(|s| s.url.as_str()),
-                        "ts": t.snapshot.as_ref().and_then(|s| s.ts.as_deref()),
-                        "detail": t.note.as_deref(),
-                    })
-                    .to_string()
-                } else {
-                    let val = match (&t.status, &t.snapshot) {
-                        (Status::Confirmed, Some(s)) => s.url.as_str(),
-                        (Status::Pending, _) => "pending",
-                        (Status::Absent, _) => "none",
-                        _ => "error",
-                    };
-                    format!("{}\t{}", t.witness, val)
-                };
-                let _ = writeln!(out, "{line}");
-                let _ = out.flush();
-            }
+fn dispatch(options: &Options, key: &Credential) -> Result<ExitCode, Error> {
+    let witnesses = match alibi::select(&options.witness_spec, key) {
+        Ok(list) => list,
+        Err(bad) => {
+            tracing::warn!(error = %bad, "bad --witness list");
+            eprintln!("alibi: {bad}\n\n{HELP}");
+            return Ok(ExitCode::from(EXIT_USAGE));
         }
     };
-
-    let results = match mode {
-        Mode::Establish => {
-            alibi::establish(&url, &witnesses, Duration::from_secs(timeout_secs), &mut emit)
-        }
-        Mode::Check => alibi::check(&url, &witnesses, &mut emit),
-        Mode::Submit => alibi::submit_only(&url, &witnesses, &mut emit),
+    let mut out = io::stdout().lock();
+    let mut sink = |testimony: &Testimony| emit(&mut out, testimony, options.json);
+    let results = match options.mode {
+        Mode::Establish => alibi::establish(&options.url, &witnesses, options.timeout, &mut sink)?,
+        Mode::Check => alibi::check(&options.url, &witnesses, &mut sink)?,
+        Mode::Submit => alibi::submit_only(&options.url, &witnesses, &mut sink)?,
+        Mode::Mcp => Vec::new(),
     };
+    verdict(&options.mode, &results)
+}
 
+fn emit(out: &mut impl Write, testimony: &Testimony, json: bool) -> Result<(), Error> {
+    if let Line::Data(note) = note_of(testimony)? {
+        eprintln!("alibi: {note}");
+    }
+    write_line(out, testimony, json)
+}
+
+fn verdict(mode: &Mode, results: &[Testimony]) -> Result<ExitCode, Error> {
     let counted: Vec<&Testimony> = results
         .iter()
         .filter(|t| t.status != Status::Skipped)
         .collect();
     if counted.is_empty() {
         eprintln!("alibi: no usable witnesses (set ARCHIVE_ORG_KEY or widen --witness)");
-        return 2;
+        return Ok(ExitCode::from(EXIT_NONE));
     }
-    if matches!(mode, Mode::Submit) {
-        let fired = counted.iter().any(|t| t.status == Status::Submitted);
-        return if fired { 0 } else { 2 };
+    if let Mode::Submit = mode {
+        let fired = counted
+            .iter()
+            .filter(|t| t.status == Status::Submitted)
+            .count();
+        if fired > 0 {
+            return Ok(ExitCode::from(EXIT_ALL));
+        }
+        return Ok(ExitCode::from(EXIT_NONE));
     }
     let confirmed = counted
         .iter()
         .filter(|t| t.status == Status::Confirmed)
         .count();
     if confirmed == counted.len() {
-        0
-    } else if confirmed > 0 {
-        1
-    } else {
-        2
+        return Ok(ExitCode::from(EXIT_ALL));
     }
-}
-
-fn usage(msg: &str) -> i32 {
-    eprintln!("alibi: {msg}\n\n{HELP}");
-    64
+    if confirmed > 0 {
+        return Ok(ExitCode::from(EXIT_SOME));
+    }
+    Ok(ExitCode::from(EXIT_NONE))
 }

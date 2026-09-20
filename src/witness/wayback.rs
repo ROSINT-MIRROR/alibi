@@ -1,20 +1,19 @@
-use super::{Snapshot, Witness, agent, short_err};
+use crate::config::{WAYBACK_CDX, WAYBACK_PREFIX, WAYBACK_SAVE};
+use crate::error::Error;
 use crate::time_util;
-
-pub const KEY_ENV: &str = "ARCHIVE_ORG_KEY";
+use crate::witness::credential::Credential;
+use crate::witness::net::{agent, body_of};
+use crate::witness::record::Record;
+use crate::witness::trait_def::{Attempted, Availability, Reading, Witness};
+use crate::witness::types::Snapshot;
 
 pub struct Wayback {
-    key: Option<String>,
+    key: Credential,
 }
 
 impl Wayback {
-    pub fn from_env() -> Self {
-        Self {
-            key: std::env::var(KEY_ENV)
-                .ok()
-                .map(|k| k.trim().to_string())
-                .filter(|k| k.contains(':')),
-        }
+    pub fn new(key: Credential) -> Result<Wayback, Error> {
+        Ok(Wayback { key })
     }
 }
 
@@ -23,79 +22,92 @@ impl Witness for Wayback {
         "wayback"
     }
 
-    fn available(&self) -> Result<(), String> {
+    fn available(&self) -> Result<Availability, Error> {
         match &self.key {
-            Some(_) => Ok(()),
-            // anon /save lane is dead (CLAUDE.md doctrine §3) — key or nothing
-            None => Err(format!(
-                "{KEY_ENV} not set — free key: https://archive.org/account/s3.php"
-            )),
+            Credential::Key(_secret) => Ok(Availability::Ready),
+            Credential::Absent => Ok(Availability::Unusable(Error::NoKey)),
         }
     }
 
-    fn submit(&self, url: &str) -> Result<String, String> {
-        let key = self.key.as_deref().ok_or("no key")?;
-        let resp = agent()
-            .post("https://web.archive.org/save")
+    fn submit(&self, url: &str) -> Result<Attempted, Error> {
+        let key = match &self.key {
+            Credential::Key(secret) => secret,
+            Credential::Absent => return Ok(Attempted::Refused(Error::NoKey)),
+        };
+        let sent = agent()?
+            .post(WAYBACK_SAVE)
             .set("Accept", "application/json")
             .set("Authorization", &format!("LOW {key}"))
-            .send_form(&[("url", url), ("capture_all", "1"), ("skip_first_archive", "1")])
-            .map_err(short_err)?;
-        let body = resp.into_string().map_err(|e| e.to_string())?;
-        let job = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("job_id").and_then(|j| j.as_str()).map(String::from));
-        Ok(job.map_or_else(|| "accepted".into(), |j| format!("job {j}")))
+            .send_form(&[
+                ("url", url),
+                ("capture_all", "1"),
+                ("skip_first_archive", "1"),
+            ]);
+        match sent {
+            Ok(response) => Ok(Attempted::Accepted(job_note(&body_of(response)?)?)),
+            Err(failure) => {
+                let carried = Error::from(failure);
+                tracing::warn!(error = %carried, "wayback submit refused, carrying to caller");
+                Ok(Attempted::Refused(carried))
+            }
+        }
     }
 
-    fn newest(&self, url: &str) -> Result<Option<Snapshot>, String> {
-        let resp = agent()
-            .get("https://web.archive.org/cdx/search/cdx")
+    fn newest(&self, url: &str) -> Result<Reading, Error> {
+        let request = agent()?
+            .get(WAYBACK_CDX)
             .query("url", url)
             .query("output", "json")
             .query("limit", "-1")
-            .query("fl", "timestamp,original")
-            .call()
-            .map_err(short_err)?;
-        let body = resp.into_string().map_err(|e| e.to_string())?;
-        Ok(cdx_newest(&body).map(|(ts, orig)| Snapshot {
-            url: format!("https://web.archive.org/web/{ts}/{orig}"),
-            epoch: time_util::ts14_to_epoch(&ts),
-            ts: Some(ts),
-        }))
+            .query("fl", "timestamp,original");
+        match request.call() {
+            Ok(response) => Ok(Reading::Found(cdx_newest(&body_of(response)?)?)),
+            Err(failure) => {
+                let carried = Error::from(failure);
+                tracing::warn!(error = %carried, "wayback cdx read failed, carrying to caller");
+                Ok(Reading::Failed(carried))
+            }
+        }
     }
 }
 
-pub(crate) fn cdx_newest(body: &str) -> Option<(String, String)> {
-    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
-    let rows = v.as_array()?;
-    // row 0 is the CDX header; limit=-1 means data rows are newest-last
-    let row = rows.iter().skip(1).next_back()?;
-    let ts = row.get(0)?.as_str()?.to_string();
-    let orig = row.get(1)?.as_str()?.to_string();
-    Some((ts, orig))
+pub fn job_note(body: &str) -> Result<String, Error> {
+    let accepted = "accepted".to_string();
+    let parsed = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => value,
+        Err(malformed) => return Err(Error::Parse(malformed.to_string())),
+    };
+    let Some(job) = parsed.get("job_id").and_then(|id| id.as_str()) else {
+        return Ok(accepted);
+    };
+    Ok(format!("job {job}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cdx_parses_newest_row() {
-        let body = r#"[["timestamp","original"],
-["20260526193415","https://www.ksl.com/article/51374190"],
-["20260526193504","https://www.ksl.com/article/51374190"]]"#;
-        let (ts, orig) = cdx_newest(body).unwrap();
-        assert_eq!(ts, "20260526193504");
-        assert_eq!(orig, "https://www.ksl.com/article/51374190");
+pub fn cdx_newest(body: &str) -> Result<Record, Error> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Ok(Record::Nothing);
     }
-
-    #[test]
-    fn cdx_empty_and_garbage() {
-        assert_eq!(cdx_newest("[]"), None);
-        assert_eq!(cdx_newest(""), None);
-        assert_eq!(cdx_newest("<html>503</html>"), None);
-        // header only, no captures
-        assert_eq!(cdx_newest(r#"[["timestamp","original"]]"#), None);
-    }
+    let parsed = match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value) => value,
+        Err(malformed) => return Err(Error::Parse(malformed.to_string())),
+    };
+    let Some(rows) = parsed.as_array() else {
+        return Err(Error::Parse("cdx body is not a json array".to_string()));
+    };
+    let Some(row) = rows.iter().skip(1).next_back() else {
+        return Ok(Record::Nothing);
+    };
+    let Some(ts) = row.get(0).and_then(|cell| cell.as_str()) else {
+        return Err(Error::Parse("cdx row has no timestamp".to_string()));
+    };
+    let Some(original) = row.get(1).and_then(|cell| cell.as_str()) else {
+        return Err(Error::Parse("cdx row has no original url".to_string()));
+    };
+    let epoch = time_util::ts14_to_epoch(ts)?;
+    Ok(Record::Archived(Snapshot {
+        url: format!("{WAYBACK_PREFIX}{ts}/{original}"),
+        epoch: Some(epoch),
+        ts: Some(ts.to_string()),
+    }))
 }
