@@ -6,6 +6,7 @@ rust-version = "1.89"
 description = "Third-party witness archiver: get a URL independent, publicly verifiable alibis"
 license = "0BSD"
 readme = "README.md"
+repository = "https://github.com/ROSINT-MIRROR/alibi"
 keywords = ["archive", "journalism", "wayback", "osint", "preservation"]
 categories = ["command-line-utilities"]
 include = [
