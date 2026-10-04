@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Alibi — independently archived</title>
+  <desc id="desc">A document surrounded by three independent archive witnesses.</desc>
+  <style>:root{--ink:#0d1110;--paper:#f2eee7;--alibi:#ffb84d;--verify:#51ff0d}</style>
+  <circle cx="256" cy="256" r="174" fill="none" stroke="var(--alibi)" stroke-width="30"/>
+  <path d="M178 142h117l54 54v174H178z" fill="var(--paper)"/>
+  <path d="M295 142v54h54" fill="none" stroke="var(--ink)" stroke-width="18" stroke-linejoin="round"/>
+  <path d="M215 240h96M215 278h82M215 316h68" fill="none" stroke="var(--ink)" stroke-width="13" stroke-linecap="round"/>
+  <g fill="var(--verify)" stroke="var(--ink)" stroke-width="12">
+    <circle cx="106" cy="168" r="31"/><circle cx="406" cy="168" r="31"/><circle cx="256" cy="430" r="31"/>
+  </g>
+</svg>
